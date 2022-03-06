@@ -91,3 +91,108 @@ def predict(data : request_body):
      
     # Return the Result
     return { 'class' : iris.target_names[class_idx]}
+
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("acks", "all");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+ for (int i = 0; i < 100; i++)
+    producer.send(new ProducerRecord<String, String>("my-topic", Integer.toString(i), Integer.toString(i)));
+
+ producer.close();
+ 
+ private Future<RecordMetadata> doSend(ProducerRecord<K, V> record, Callback callback) {
+        TopicPartition tp = null;
+        try {
+        
+            throwIfProducerClosed();
+            // first make sure the metadata for the topic is available
+            ClusterAndWaitTime clusterAndWaitTime;
+            try {
+                
+                clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), maxBlockTimeMs);
+            } catch (KafkaException e) {
+                if (metadata.isClosed())
+                    throw new KafkaException("Producer closed while send in progress", e);
+                throw e;
+            }
+            long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
+            Cluster cluster = clusterAndWaitTime.cluster;
+            byte[] serializedKey;
+            try {
+            	
+                serializedKey = keySerializer.serialize(record.topic(), record.headers(), record.key());
+            } catch (ClassCastException cce) {
+                throw new SerializationException("Can't convert key of class " + record.key().getClass().getName() +
+                        " to class " + producerConfig.getClass(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG).getName() +
+                        " specified in key.serializer", cce);
+            }
+            byte[] serializedValue;
+            try {
+                
+                serializedValue = valueSerializer.serialize(record.topic(), record.headers(), record.value());
+            } catch (ClassCastException cce) {
+                throw new SerializationException("Can't convert value of class " + record.value().getClass().getName() +
+                        " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
+                        " specified in value.serializer", cce);
+            }
+            
+            int partition = partition(record, serializedKey, serializedValue, cluster);
+            tp = new TopicPartition(record.topic(), partition);
+
+            setReadOnly(record.headers());
+            Header[] headers = record.headers().toArray();
+
+            int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
+                    compressionType, serializedKey, serializedValue, headers);
+           
+            ensureValidRecordSize(serializedSize);
+            long timestamp = record.timestamp() == null ? time.milliseconds() : record.timestamp();
+            log.trace("Sending record {} with callback {} to topic {} partition {}", record, callback, record.topic(), partition);
+            // producer callback will make sure to call both 'callback' and interceptor callback
+            Callback interceptCallback = new InterceptorCallback<>(callback, this.interceptors, tp);
+
+            if (transactionManager != null && transactionManager.isTransactional())
+                transactionManager.maybeAddPartitionToTransaction(tp);
+			
+            RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
+                    serializedValue, headers, interceptCallback, remainingWaitMs);
+             
+            if (result.batchIsFull || result.newBatchCreated) {
+                log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
+                 
+                this.sender.wakeup();
+            }
+            return result.future;
+            // handling exceptions and record the errors;
+            // for API exceptions return them in the future,
+            // for other exceptions throw directly
+        } catch (ApiException e) {
+            log.debug("Exception occurred during message send:", e);
+            if (callback != null)
+                callback.onCompletion(null, e);
+            this.errors.record();
+            this.interceptors.onSendError(record, tp, e);
+            return new FutureFailure(e);
+        } catch (InterruptedException e) {
+            this.errors.record();
+            this.interceptors.onSendError(record, tp, e);
+            throw new InterruptException(e);
+        } catch (BufferExhaustedException e) {
+            this.errors.record();
+            this.metrics.sensor("buffer-exhausted-records").record();
+            this.interceptors.onSendError(record, tp, e);
+            throw e;
+        } catch (KafkaException e) {
+            this.errors.record();
+            this.interceptors.onSendError(record, tp, e);
+            throw e;
+        } catch (Exception e) {
+            // we notify interceptor about all exceptions, since onSend is called before anything else in this method
+            this.interceptors.onSendError(record, tp, e);
+            throw e;
+        }
+    }
